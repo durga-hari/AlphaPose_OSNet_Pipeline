@@ -10,16 +10,17 @@ VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v"}
 def _infer_cam_id(p: Path) -> str:
     """
     Derive a camera id from file name.
-    Examples:
-      'FC_1_cam1080.mp4' -> 'FC_1'
-      'AC_10_sceneA.mkv' -> 'AC_10'
-      'LobbyWest.mp4'    -> 'LobbyWest'
+    Supports: FC1, FC_1, AC10, AC_10, also with dashes/spaces.
+    Normalizes to 'FC1'/'AC10' (no underscore).
     """
     stem = p.stem
-    m = re.search(r"(?:^|[_\-\s])((?:FC|AC)_[0-9]+)", stem, flags=re.I)
+    m = re.search(r'(?i)\b(FC|AC)[ _-]?(\d{1,3})\b', stem)
     if m:
-        return m.group(1).upper()
+        return f"{m.group(1).upper()}{m.group(2)}"
     return stem  # fallback: use filename (without extension)
+
+
+
 
 @dataclass
 class Config:
