@@ -23,5 +23,11 @@ dependencies:
       - pycocotools
       - onnx
       - onnxruntime-gpu
+      - torchreid
+      - gdown
+      - tensorboard
+      - cython
+      - easydict
+
 
 

@@ -11,12 +11,12 @@ def _handle_sigint(signum, frame):
 signal.signal(signal.SIGINT, _handle_sigint)
 
 # pipeline/pipeline.py
-from Pipeline.alphapose_wrapper import load_alphapose
-from Pipeline.osnet_wrapper import load_osnet
-from Pipeline.inference_runner import run_inference   # if you keep a helper there
-from Pipeline.tracker import MultiCameraPersonTracker
-from utils.visualizer import draw_bbox_and_id, draw_skeleton
-from utils.io_utils import PoseWriter, human_readable_fps
+from .alphapose_wrapper import load_alphapose
+from .osnet_wrapper import load_osnet
+from .tracker import MultiCameraPersonTracker
+from .inference_runner import run_inference
+from ..utils.visualizer import draw_bbox_and_id, draw_skeleton
+
 # ...
 # Output writer should use Config.output_dir, which is now: /home/athena/DaRA_Thesis/Output_AP_OSNET
 
