@@ -1,0 +1,27 @@
+name: alphapose-pipeline
+channels: [pytorch, nvidia, conda-forge]
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - cython
+  - pyyaml
+  - pillow
+  - scipy
+  - matplotlib
+  - scikit-image
+  - scikit-learn
+  - shapely
+  - pip:
+      - "numpy<2.0"
+      - tqdm
+      - yacs
+      - opencv-python-headless
+      - pycocotools
+      - onnx
+      - onnxruntime-gpu
+
+
