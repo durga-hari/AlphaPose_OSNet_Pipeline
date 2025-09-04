@@ -1,0 +1,10 @@
+# AlphaPose build/cache/artifacts
+AlphaPose/__pycache__/
+AlphaPose/build/
+AlphaPose/exps/logs/
+AlphaPose/outputs/
+AlphaPose/datasets/
+AlphaPose/*.pth
+AlphaPose/*.pt
+AlphaPose/*.onnx
+AlphaPose/*.weights
