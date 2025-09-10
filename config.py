@@ -1,110 +1,82 @@
-# /home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/config.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
-import os, re, torch
+from typing import Optional
 
-# Recognized video extensions
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".m4v"}
+# --- Repo layout --------------------------------------------------------------
+REPO_ROOT     = Path(__file__).resolve().parent
+ALPHAPOSE_DIR = (REPO_ROOT / "AlphaPose").resolve()
+PIPELINE_DIR  = (REPO_ROOT / "Pipeline").resolve()
 
-def _infer_cam_id(p: Path) -> str:
-    """
-    Derive a camera id from file name.
-    Supports: FC1, FC_1, AC10, AC_10, also with dashes/spaces.
-    Normalizes to 'FC1'/'AC10' (no underscore).
-    """
-    stem = p.stem
-    m = re.search(r'(?i)\b(FC|AC)[ _-]?(\d{1,3})\b', stem)
-    if m:
-        return f"{m.group(1).upper()}{m.group(2)}"
-    return stem  # fallback: use filename (without extension)
+# --- IO defaults --------------------------------------------------------------
+INPUT_ROOT  = Path("/home/athena/DaRA_Thesis/Session 4").resolve()
+OUTPUT_ROOT = Path("/home/athena/DaRA_Thesis/Output_AP_OSNET").resolve()
 
+# --- Detector selection -------------------------------------------------------
+# "alphapose" -> AlphaPose YOLOv3 (works without Ultralytics)
+# "yolov8"    -> Ultralytics YOLOv8 (requires: pip install ultralytics)
+DETECTOR_DEFAULT = "alphapose"
 
+# --- AlphaPose YOLOv3 (internal) ---------------------------------------------
+YOLO_CFG     = (ALPHAPOSE_DIR / "detector/yolo/cfg/yolov3.cfg").resolve()
+YOLO_WEIGHTS = (ALPHAPOSE_DIR / "detector/yolo/weight/yolov3.weights").resolve()
+YOLO_CONF    = 0.25
+YOLO_IOU     = 0.45
 
+# --- YOLOv8 (Ultralytics) -----------------------------------------------------
+Y8_MODEL   = "yolov8s"  # used only if Y8_WEIGHTS doesn't exist
+Y8_WEIGHTS = (PIPELINE_DIR / "pretrained/detectors/yolov8s.pt").resolve()
+Y8_CONF    = 0.25
+Y8_IOU     = 0.45
+
+# --- Pose: HRNet (COCO-17) ----------------------------------------------------
+POSE_CFG  = (ALPHAPOSE_DIR / "configs/coco/hrnet/256x192_w32_lr1e-3.yaml").resolve()
+POSE_CKPT = (ALPHAPOSE_DIR / "pretrained_models/pose_hrnet_w32_256x192.pth").resolve()
+
+# --- ReID: OSNet --------------------------------------------------------------
+OSNET_WEIGHT = (PIPELINE_DIR / "pretrained/osnet_x1_0_msmt17.pth").resolve()
+
+# --- Runtime defaults ---------------------------------------------------------
+DEVICE       = "cuda"   # auto-falls back to CPU
+REID_SIM_THR = 0.45
+REID_IOU_THR = 0.20
+REID_TTL     = 60
 
 @dataclass
-class Config:
-    # ---- Input session folder (with space is OK) ----
-    input_dir: str = "/home/athena/DaRA_Thesis/Session 4"
+class ModelPaths:
+    alphapose_dir: Path = ALPHAPOSE_DIR
+    yolo_cfg: Path = YOLO_CFG
+    yolo_weights: Path = YOLO_WEIGHTS
+    y8_model: str = Y8_MODEL
+    y8_weights: Optional[Path] = Y8_WEIGHTS
+    pose_cfg: Path = POSE_CFG
+    pose_ckpt: Path = POSE_CKPT
+    osnet_weight: Optional[Path] = OSNET_WEIGHT
 
-    # Populated automatically from input_dir in __post_init__
-    input_video_paths: list[str] = field(default_factory=list)
-    camera_ids: list[str]        = field(default_factory=list)
+@dataclass
+class RunDefaults:
+    input_root: Path = INPUT_ROOT
+    output_root: Path = OUTPUT_ROOT
+    device: str = DEVICE
+    detector: str = DETECTOR_DEFAULT
+    yolo_conf: float = YOLO_CONF
+    yolo_iou: float = YOLO_IOU
+    y8_conf: float = Y8_CONF
+    y8_iou: float = Y8_IOU
+    reid_sim_thr: float = REID_SIM_THR
+    reid_iou_thr: float = REID_IOU_THR
+    reid_ttl: int = REID_TTL
 
-    # ---- Output ----
-    output_dir: str = "/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Output_AP_OSNET"
+def print_config():
+    mp, rd = ModelPaths(), RunDefaults()
+    print("=== REPO ROOT ===", REPO_ROOT)
+    print("\n=== MODEL PATHS ===")
+    for k, v in asdict(mp).items(): print(f"{k:12s}: {v}")
+    print("\n=== DEFAULTS ===")
+    for k, v in asdict(rd).items(): print(f"{k:12s}: {v}")
 
-    # ---- Device / runtime ----
-    device: str = os.environ.get("DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu")
-    use_fp16: bool = os.environ.get("FP16", "1").lower() in ("1", "true", "yes")
-    cudnn_benchmark: bool = True
-    cudnn_deterministic: bool = False
-    draw_outputs: bool = True
-
-    # ---- AlphaPose base (all other AP subpaths are derived from this) ----
-    alphapose_path: str = "/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose"
-
-    # Auto-derived AlphaPose paths (filled in __post_init__)
-    detector_config: str = ""
-    detector_checkpoint: str = ""
-    yolo_names: str = ""
-    alphapose_config: str = ""
-    alphapose_checkpoint: str = ""
-
-    # ---- OSNet (ReID) ----
-    osnet_model: str = "osnet_x1_0"
-    osnet_weights: str = "/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/pretrained/osnet_x1_0_msmt17.pth"
-
-    # ---- Thresholds / perf ----
-    det_conf_threshold: float = 0.25
-    det_nms_threshold: float = 0.45
-    frame_skip: int = 1
-    detector_scale: float = 1.0
-    progress_every: int = 200
-    checkpoint_every: int = 1000
-    debug_draw_dets: bool = False
-
-    def __post_init__(self):
-        # Derive AlphaPose subpaths (same subfolders, new base)
-        base = Path(self.alphapose_path)
-        self.detector_config      = str(base / "detector/yolo/cfg/yolov3-spp.cfg")
-        self.detector_checkpoint  = str(base / "detector/yolo/data/yolov3-spp.weights")
-        self.yolo_names           = str(base / "detector/yolo/data/coco.names")
-        self.alphapose_config     = str(base / "configs/hrnet/pose_hrnet_w32_384x288.yaml")
-        self.alphapose_checkpoint = str(base / "pretrained_models/pose_hrnet_w32_384x288.pth")
-
-        # Ensure output dir exists
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-
-        # Discover videos from input_dir (flat first, then recurse if needed)
-        in_dir = Path(self.input_dir)
-        if not in_dir.is_dir():
-            raise FileNotFoundError(f"Input dir not found: {in_dir}")
-
-        vids = [p for p in sorted(in_dir.iterdir()) if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-        if not vids:
-            vids = [p for p in sorted(in_dir.rglob("*")) if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-
-        if not vids:
-            raise FileNotFoundError(f"No video files found under: {in_dir}")
-
-        self.input_video_paths = [str(p) for p in vids]
-        self.camera_ids        = [_infer_cam_id(p) for p in vids]
-
-        if len(self.camera_ids) != len(self.input_video_paths):
-            raise RuntimeError("camera_ids and input_video_paths length mismatch")
-
-    def validate(self) -> list[str]:
-        checks = [
-            (self.detector_config, "Detector cfg"),
-            (self.detector_checkpoint, "Detector weights"),
-            (self.yolo_names, "Detector names"),
-            (self.alphapose_config, "AlphaPose YAML"),
-            (self.alphapose_checkpoint, "AlphaPose checkpoint"),
-            (self.osnet_weights, "OSNet weights"),
-        ]
-        missing = [f"{label} not found: {p}" for p, label in checks if not Path(p).is_file()]
-        for p in self.input_video_paths:
-            if not Path(p).is_file():
-                missing.append(f"Input video missing: {p}")
-        return missing
+if __name__ == "__main__":
+    print_config()

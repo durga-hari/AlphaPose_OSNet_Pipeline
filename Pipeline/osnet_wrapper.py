@@ -1,100 +1,179 @@
-# Pipeline/osnet_wrapper.py
-import torch
-from torchvision import transforms as T
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# torchreid imports
-import torchreid
-from torchreid import models
+"""
+osnet_wrapper.py
 
-def _build_osnet(model_name: str = "osnet_x1_0", device: str = "cuda"):
-    # num_classes dummy since we just do feature extraction
-    model = models.build_model(
-        name=model_name,
-        num_classes=1000,
-        loss="softmax",
-        pretrained=False,   # we'll load our own checkpoint
-    )
-    model.eval().to(device)
-    return model
+Robust OSNet feature extractor.
 
-def _safe_load_state_dict(path: str):
-    """
-    Robust loader compatible with PyTorch >=2.6 where weights_only=True is default.
-    Forces weights_only=False and unwraps common state_dict layouts.
-    """
-    # IMPORTANT: weights_only=False to allow legacy pickled checkpoints
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+- Prefers torchreid FeatureExtractor (model_name="osnet_x1_0") with a given .pth.
+- If torchreid is missing or weight path is None/invalid, runs in "disabled" mode
+  and returns [None] features (the pipeline still runs).
+- Always converts features to CPU NumPy arrays and L2-normalizes them.
 
-    # Common layouts
-    if isinstance(ckpt, dict):
-        for k in ("state_dict", "model_state_dict", "model", "net"):
-            if k in ckpt and isinstance(ckpt[k], dict):
-                ckpt = ckpt[k]
-                break
+Usage:
+  from .osnet_wrapper import OSNetExtractor
+  osn = OSNetExtractor(weight=Path("Pipeline/pretrained/osnet_x1_0_msmt17.pth"), device="cuda")
+  feats = osn.extract(frame_bgr, boxes)  # -> list of np.ndarray (D,) or None
+"""
 
-    if not isinstance(ckpt, dict):
-        raise TypeError(f"Unsupported checkpoint format at {path}: {type(ckpt)}")
+from __future__ import annotations
+from pathlib import Path
+from typing import List, Optional
+import logging
+import numpy as np
+import cv2
 
-    # Strip possible 'module.' prefixes
-    state = {}
-    for k, v in ckpt.items():
-        nk = k
-        if nk.startswith("module."):
-            nk = nk[len("module."):]
-        state[nk] = v
-    return state
+log = logging.getLogger(__name__)
 
-def _make_transform(size=256):
-    # Basic, deterministic transform for person ReID crops
-    return T.Compose([
-        T.ToPILImage(),
-        T.Resize((size, size)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-    ])
 
-def load_osnet(config):
-    """
-    Returns:
-      - reid_model: torch.nn.Module on config.device
-      - reid_tf: callable(np.ndarray HxWxC BGR or RGB) -> torch.FloatTensor CHW (RGB normalized)
-    """
-    device = config.device if hasattr(config, "device") else ("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = getattr(config, "osnet_model", "osnet_x1_0")
-    weights = getattr(config, "osnet_weights", "")
+class OSNetExtractor:
+    def __init__(
+        self,
+        weight: Optional[Path],
+        device: str = "cuda",
+        require_torchreid: bool = False,
+        model_name: str = "osnet_x1_0",
+    ):
+        """
+        Parameters
+        ----------
+        weight : Path | None
+            Path to OSNet checkpoint (.pth). If None or missing, extractor is disabled.
+        device : str
+            "cuda" or "cpu"
+        require_torchreid : bool
+            If True, raise ImportError when torchreid is missing. Otherwise log & disable.
+        model_name : str
+            torchreid model name. Default "osnet_x1_0".
+        """
+        self.device = "cuda" if str(device).lower() == "cuda" else "cpu"
+        self._ext = None
+        self._ok = False
 
-    print(f"[INFO] Loading OSNet weights: {weights}")
+        if weight is None:
+            log.warning("OSNetExtractor: no weight provided; embeddings disabled.")
+            return
 
-    # Build model
-    model = _build_osnet(model_name=model_name, device=device)
+        w = Path(weight).resolve()
+        if not w.exists():
+            log.warning("OSNetExtractor: weight not found at %s; embeddings disabled.", w)
+            return
 
-    # Load checkpoint robustly (bypass torchreid helper to force weights_only=False)
-    state = _safe_load_state_dict(weights)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"[OSNET] Missing keys: {len(missing)} (showing up to 5): {missing[:5]}")
-    if unexpected:
-        print(f"[OSNET] Unexpected keys: {len(unexpected)} (showing up to 5): {unexpected[:5]}")
+        # Try to import torchreid
+        try:
+            from torchreid.utils import FeatureExtractor  # type: ignore
+        except Exception as e:
+            msg = (
+                "OSNetExtractor: 'torchreid' not installed. "
+                "Install with: pip install git+https://github.com/KaiyangZhou/deep-person-reid.git "
+                f"(detail: {e})"
+            )
+            if require_torchreid:
+                raise ImportError(msg)
+            log.warning(msg)
+            return
 
-    # Simple transform for BGR/RGB numpy image crops from pipeline._extract_feats
-    tf = _make_transform()
+        # Initialize feature extractor
+        try:
+            self._ext = FeatureExtractor(
+                model_name=model_name,
+                model_path=str(w),
+                device=self.device,
+            )
+            # Some torchreid versions print model stats on init; keep our own log too.
+            log.info("OSNetExtractor loaded: %s (device=%s)", w, self.device)
+            self._ok = True
+        except Exception as e:
+            log.warning("OSNetExtractor failed to initialize with %s: %s", w, e)
+            self._ext = None
+            self._ok = False
 
-    def reid_tf(img_bgr_or_rgb):
-        import numpy as np, cv2
-        arr = img_bgr_or_rgb
-        if isinstance(arr, torch.Tensor):
-            # assume already CHW float [0,1]
-            x = arr
-        else:
-            # numpy HxWxC (BGR or RGB). Ensure RGB uint8
-            if arr is None or arr.size == 0:
-                # return zero tensor to keep pipeline flowing
-                return torch.zeros(3, 256, 256, dtype=torch.float32)
-            if arr.shape[-1] == 3:
-                # assume BGR from OpenCV, convert to RGB
-                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-            x = tf(arr)  # CHW float
-        return x
+    def is_ready(self) -> bool:
+        return bool(self._ok and self._ext is not None)
 
-    return model, reid_tf
+    def _crop_rgb_list(self, frame_bgr, boxes_xyxy: List[List[float]]) -> List[np.ndarray]:
+        H, W = frame_bgr.shape[:2]
+        crops: List[np.ndarray] = []
+        for b in boxes_xyxy:
+            x1, y1, x2, y2 = [int(round(v)) for v in b[:4]]
+            x1 = max(0, min(W - 1, x1))
+            x2 = max(0, min(W - 1, x2))
+            y1 = max(0, min(H - 1, y1))
+            y2 = max(0, min(H - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                # use a tiny dummy crop to keep alignment (torchreid can handle arbitrary sizes)
+                crops.append(np.zeros((16, 8, 3), dtype=np.uint8))
+                continue
+            crop = frame_bgr[y1:y2, x1:x2]
+            crops.append(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        return crops
+
+    def extract(self, frame_bgr, boxes_xyxy: List[List[float]]) -> List[Optional[np.ndarray]]:
+        """
+        Returns a list of feature vectors (np.ndarray, L2-normalized) or None per box.
+        """
+        n = len(boxes_xyxy)
+        if n == 0:
+            return []
+        if not self.is_ready():
+            return [None] * n
+
+        crops = self._crop_rgb_list(frame_bgr, boxes_xyxy)
+
+        try:
+            feats = self._ext(crops)  # may return a list/ndarray of tensors or numpy arrays
+        except Exception as e:
+            log.warning("OSNetExtractor: feature extraction failed (%s). Returning None features.", e)
+            return [None] * n
+
+        out: List[Optional[np.ndarray]] = []
+
+        # We’ll support both torch.Tensor and np.ndarray results
+        # without importing torch globally (avoid hard dep if disabled).
+        torch = None  # lazy import only if needed
+        for f in feats:
+            if f is None:
+                out.append(None)
+                continue
+
+            # Handle torch.Tensor
+            if "torch" in type(f).__module__:
+                if torch is None:
+                    try:
+                        import torch as _torch  # type: ignore
+                        torch = _torch
+                    except Exception:
+                        torch = None
+                if torch is not None and isinstance(f, torch.Tensor):
+                    try:
+                        v = f.detach().cpu().numpy().astype(np.float32).reshape(-1)
+                    except Exception as e:
+                        log.warning("OSNetExtractor: tensor -> numpy failed (%s).", e)
+                        out.append(None)
+                        continue
+                else:
+                    # Unexpected type
+                    out.append(None)
+                    continue
+            else:
+                # Assume it's already a numpy-like
+                try:
+                    v = np.asarray(f, dtype=np.float32).reshape(-1)
+                except Exception as e:
+                    log.warning("OSNetExtractor: array cast failed (%s).", e)
+                    out.append(None)
+                    continue
+
+            # L2 normalize
+            norm = float(np.linalg.norm(v) + 1e-12)
+            v = v / norm
+            out.append(v)
+
+        # Keep length aligned with input boxes
+        if len(out) != n:
+            if len(out) < n:
+                out.extend([None] * (n - len(out)))
+            else:
+                out = out[:n]
+        return out
