@@ -1,132 +1,219 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
-import argparse, logging
+
+import argparse
+import logging
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Optional
 
-from ..config import (
-    ALPHAPOSE_DIR, YOLO_CFG, YOLO_WEIGHTS, YOLO_CONF, YOLO_IOU,
-    Y8_MODEL, Y8_WEIGHTS, Y8_CONF, Y8_IOU,
-    POSE_CFG, POSE_CKPT, OSNET_WEIGHT, OUTPUT_ROOT, DEVICE,
-    REID_SIM_THR, REID_IOU_THR, REID_TTL, DETECTOR_DEFAULT
+# ---- Our utils (package path you asked for) -------------------------------
+from AlphaPose_OSNet_Pipeline.utils.io_utils import (
+    ensure_dir,
+    safe_stem,
+    video_writer,
+    jsonl_writer,
 )
-from AlphaPose_OSNet_Pipeline.utils.io_utils import ensure_dir
-from .alphapose_wrapper import AlphaPoseRunner, AlphaPoseNotReady
-from .osnet_wrapper import OSNetExtractor
-from .strongsort_tracker import StrongSORTTracker
-from .inference_runner import InferenceRunner
-from .yolov8_wrapper import YOLOv8Detector
 
-log = logging.getLogger("pipeline")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ---- Pipeline modules -----------------------------------------------------
+# AlphaPose wrapper (no 'device' kwarg!)
+from AlphaPose_OSNet_Pipeline.Pipeline.alphapose_wrapper import (
+    AlphaPoseRunner,
+    SPPEConfig,
+)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Toggle: AlphaPose YOLOv3 or YOLOv8 + HRNet + OSNet")
-    p.add_argument("--video", required=True, help="Video file or directory.")
-    p.add_argument("--cams", "--cam-id", dest="cams", default=None,
-                   help="Camera ID or comma-separated list. Defaults to video stem(s).")
-    p.add_argument("--out", default=str(OUTPUT_ROOT), help="Output directory root.")
-    p.add_argument("--alphapose-path", default=str(ALPHAPOSE_DIR), help="Path to AlphaPose folder.")
-    p.add_argument("--device", choices=["cuda", "cpu"], default=DEVICE)
-    p.add_argument("--draw", action="store_true")
-    p.add_argument("--save-video", action="store_true")
-    p.add_argument("--save-json", action="store_true")
-    p.add_argument("--save-embeds", action="store_true", help="Include OSNet embedding in JSONL.")
-    p.add_argument("--start-frame", type=int, default=0)
-    p.add_argument("--max-frames", type=int, default=None)
+# OSNet ReID extractor (expects 'weight' kwarg; returns features for tracker)
+from AlphaPose_OSNet_Pipeline.Pipeline.osnet_wrapper import OSNetExtractor
 
-    # Detector toggle
-    p.add_argument("--detector", choices=["alphapose","yolov8"], default=DETECTOR_DEFAULT)
-    # YOLOv8 knobs
-    p.add_argument("--y8-model", default=(str(Y8_WEIGHTS) if Y8_WEIGHTS.exists() else Y8_MODEL))
-    p.add_argument("--y8-conf", type=float, default=Y8_CONF)
-    p.add_argument("--y8-iou",  type=float, default=Y8_IOU)
-    # AlphaPose YOLOv3 knobs
-    p.add_argument("--yolo-cfg", default=str(YOLO_CFG))
-    p.add_argument("--yolo-weights", default=str(YOLO_WEIGHTS))
-    p.add_argument("--yolo-conf", type=float, default=YOLO_CONF)
-    p.add_argument("--yolo-iou",  type=float, default=YOLO_IOU)
-    # Pose + ReID
-    p.add_argument("--pose-cfg",  default=str(POSE_CFG))
-    p.add_argument("--pose-ckpt", default=str(POSE_CKPT))
-    p.add_argument("--osnet-weight", default=(str(OSNET_WEIGHT) if OSNET_WEIGHT.exists() else None))
-    # StrongSORT
-    p.add_argument("--reid-sim-thr", type=float, default=REID_SIM_THR)
-    p.add_argument("--reid-iou-thr", type=float, default=REID_IOU_THR)
-    p.add_argument("--reid-ttl",     type=int,   default=REID_TTL)
-    return p.parse_args()
+# Detection
+from AlphaPose_OSNet_Pipeline.Pipeline.yolov8_wrapper import YOLOv8Detector
 
-def main():
-    args = parse_args()
+# Tracking (your provided signature)
+from AlphaPose_OSNet_Pipeline.Pipeline.strongsort_tracker import StrongSORTTracker
 
-    in_path  = Path(args.video)
-    out_root = Path(args.out).resolve()
-    alpha_dir = Path(args.alphapose_path).resolve()
-    ensure_dir(out_root)
+# Inference runner (your provided signature)
+from AlphaPose_OSNet_Pipeline.Pipeline.inference_runner import InferenceRunner
 
-    # HRNet & (optional) internal YOLOv3
-    try:
-        ap = AlphaPoseRunner(
-            alphapose_dir=alpha_dir, device=args.device,
-            yolo_cfg=(Path(args.yolo_cfg) if args.detector=="alphapose" else None),
-            yolo_weights=(Path(args.yolo_weights) if args.detector=="alphapose" else None),
-            yolo_conf=args.yolo_conf, yolo_iou=args.yolo_iou,
-            pose_cfg=Path(args.pose_cfg), pose_ckpt=Path(args.pose_ckpt),
-        )
-        ap.warmup(enable_internal_detector=(args.detector=="alphapose"))
-    except (AlphaPoseNotReady, Exception) as e:
-        log.error("AlphaPose init failed: %s", e); return
 
-    # YOLOv8 (only if selected)
-    y8 = None
-    if args.detector == "yolov8":
-        # Allow either a .pt path or a model id
-        y8_weights = Path(args.y8_model) if args.y8_model.endswith(".pt") else None
-        y8_model_id = (args.y8_model if not args.y8_model.endswith(".pt") else "yolov8s")
-        try:
-            y8 = YOLOv8Detector(model=y8_model_id, weights=y8_weights,
-                                device=args.device, conf=args.y8_conf, iou=args.y8_iou)
-        except ImportError as e:
-            log.error("%s", e); return
-        except Exception as e:
-            log.error("YOLOv8 init failed: %s", e); return
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser("AlphaPose + OSNet pipeline")
 
-    # OSNet ReID
-    osn = OSNetExtractor(weight=(Path(args.osnet_weight) if args.osnet_weight else None), device=args.device)
-    if not osn.is_ready():
-        log.warning("OSNet disabled (missing torchreid or weight). Proceeding without embeddings.")
+    # IO
+    p.add_argument("--video", required=True, type=str, help="Path to input video")
+    p.add_argument("--out", required=True, type=str, help="Output directory")
 
-    tracker = StrongSORTTracker(sim_thr=args.reid_sim_thr, iou_thr=args.reid_iou_thr, ttl=args.reid_ttl)
+    # Options
+    p.add_argument(
+        "--detector",
+        default="yolov8",
+        choices=["alphapose", "yolov8"],
+        help="Which detector to use for person boxes",
+    )
+    p.add_argument("--draw", action="store_true", help="Draw boxes/poses on frames")
+    p.add_argument("--save-video", action="store_true", help="Write annotated video")
+    p.add_argument("--save-json", action="store_true", help="Write poses JSONL")
+    p.add_argument("--save-embeds", action="store_true", help="Save OSNet embeddings")
 
-    runner = InferenceRunner(
-        alphapose=ap, osnet=osn, tracker=tracker,
-        detector=args.detector, y8=y8,
-        draw=bool(args.draw), save_embeds=bool(args.save_embeds),
+    # Device (used for non-AlphaPose parts; AlphaPoseRunner pulls device from SPPEConfig)
+    p.add_argument("--device", default="cuda", type=str, help="cuda or cpu")
+
+    # YOLOv8 detector knobs
+    p.add_argument("--y8-model", type=str, required=False, help="Path to yolov8 *.pt")
+    p.add_argument("--y8-imgsz", type=int, default=640)
+    p.add_argument("--y8-half", action="store_true")
+    p.add_argument("--y8-conf", type=float, default=0.25)
+    p.add_argument("--y8-iou", type=float, default=0.45)
+
+    # OSNet weights
+    p.add_argument(
+        "--osnet-weights",
+        type=str,
+        default=str(
+            Path(__file__).parent / "pretrained" / "osnet_x1_0_msmt17.pth"
+        ),
+        help="Path to OSNet weights",
     )
 
-    # Jobs
-    jobs: List[Tuple[Path, str]] = []
-    if in_path.is_dir():
-        vids = sorted([p for p in in_path.iterdir() if p.suffix.lower() in {".mp4",".avi",".mov",".mkv"}])
-        if args.cams:
-            cam_list = [c.strip() for c in args.cams.split(",") if c.strip()]
-            for i, v in enumerate(vids):
-                cam_id = cam_list[i] if i < len(cam_list) else v.stem
-                jobs.append((v, cam_id))
-        else:
-            for v in vids: jobs.append((v, v.stem))
-    else:
-        jobs.append((in_path, (args.cams or in_path.stem)))
+    # Misc
+    p.add_argument("--max-frames", type=int, default=-1, help="Limit frames for debug")
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity",
+    )
+    p.add_argument("--log-every", type=int, default=50, help="Log every N frames")
+    return p.parse_args()
 
-    for vpath, cam in jobs:
-        cam_out = out_root / cam; ensure_dir(cam_out)
-        runner.run_on_video(
-            video_path=vpath, out_dir=cam_out, cam_id=cam,
-            save_video=bool(args.save_video), save_json=bool(args.save_json),
-            start_frame=args.start_frame, max_frames=args.max_frames,
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    )
+    log = logging.getLogger(__name__)
+    log.debug("Parsed args: %s", vars(args))
+
+    video_path = Path(args.video)
+    out_dir = Path(args.out)
+    ensure_dir(out_dir)
+
+    base = safe_stem(video_path)
+    # Where we’ll write outputs (paths are created here; passing down is OK)
+    out_video_path: Optional[Path] = (
+        (out_dir / f"{base}_ann.mp4") if args.save_video else None
+    )
+    out_jsonl_path: Optional[Path] = (
+        (out_dir / f"{base}_poses.jsonl") if args.save_json else None
+    )
+    out_embeds_dir: Optional[Path] = (
+        (out_dir / f"{base}_embeds") if args.save_embeds else None
+    )
+    if out_embeds_dir:
+        ensure_dir(out_embeds_dir)
+
+    # ------------------ Build components ------------------
+    # AlphaPose Runner (device chosen inside via SPPEConfig; no 'device' kwarg)
+
+    ap = AlphaPoseRunner(cfg=SPPEConfig(
+        input_size=(256, 192),  # (H,W)
+        device="cuda",          # or "cpu"
+        sppe_cfg_yaml=Path("/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/configs/coco/hrnet/256x192_w32_lr1e-3.yaml"),
+        sppe_checkpoint=Path("/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/pretrained_models/pose_hrnet_w32_256x192.pth"),
+        fp16=False
+    ))
+
+
+    # Detector
+    y8 = None
+    if args.detector.lower() == "yolov8":
+        if not args.y8_model:
+            log.error("--y8-model must be provided when using yolov8 detector.")
+            raise SystemExit(2)
+
+        y8 = YOLOv8Detector(
+            model="yolov8s",              # or "yolov8m/l/x" depending on which you want
+            weights=Path(args.y8_model),  # Path to your .pt file
+            device=args.device,
+            conf=args.y8_conf,
+            iou=args.y8_iou,
+            imgsz=args.y8_imgsz,
+            half=args.y8_half,
         )
+        log.info(
+            "YOLOv8Detector ready: %s (device=%s, conf=%.2f, iou=%.2f, imgsz=%d, half=%s)",
+            args.y8_model,
+            args.device,
+            args.y8_conf,
+            args.y8_iou,
+            args.y8_imgsz,
+            args.y8_half,
+        )
+
+
+    # OSNet (ReID)
+    osnet = OSNetExtractor(weight=str(Path(args.osnet_weights)), device=args.device)
+    log.info("OSNetExtractor loaded: %s (device=%s)", args.osnet_weights, args.device)
+
+    # Tracker (StrongSORT-style; your constructor)
+    tracker = StrongSORTTracker(sim_thr=0.45, iou_thr=0.3, ttl=60)
+
+    # Runner
+    runner = InferenceRunner(
+        alphapose=ap,
+        osnet=osnet,
+        tracker=tracker,
+        detector=args.detector,
+        y8=y8,
+        draw=args.draw,
+        save_embeds=args.save_embeds,
+        log_every=args.log_every,
+    )
+
+    # ------------------ Open outputs using your io_utils ------------------
+    vw = None
+    jf = None
+    try:
+        out_video_path = None
+        out_jsonl_path = None
+        #cam_id = args.cam_id if hasattr(args, "cam_id") and args.cam_id else Path(args.video).stem
+
+        if args.save_video:
+            out_video_path = Path(args.out) / f"{Path(args.video).stem}_annot.mp4"
+        if args.save_json:
+            out_jsonl_path = Path(args.out) / f"{Path(args.video).stem}_poses.jsonl"
+
+        # ------------------ Run ------------------
+        log.info("----- RUN 1/1 | cam_id=%s | video=%s -----", base, str(video_path))
+        runner.run_on_video(
+            video_path=args.video,
+            out_dir=out_dir,                   
+            cam_id=video_path.stem,
+            out_video_path=out_video_path,
+            out_jsonl_path=out_jsonl_path,
+            max_frames=args.max_frames,
+            save_video=args.save_video,
+            save_json=args.save_json,
+        )
+    finally:
+        # If we created writers here, close them
+        try:
+            if vw is not None:
+                vw.release()
+        except Exception:
+            pass
+        try:
+            if jf is not None:
+                jf.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()

@@ -1,192 +1,252 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-alphapose_wrapper.py (updated)
-
-- Still supports internal detection via AlphaPose YOLOv3.
-- NEW: pose_on_boxes(frame, boxes_xyxy) to run HRNet on *external* detections (e.g., YOLOv8).
+alphapose_wrapper.py — Robust AlphaPose SPPE loader/decoder.
+- Adapts to builder APIs: build_sppe / get_pose_net / get_model
+- Loads HRNet 256x192 weights with prefix fixups
+- BGR->RGB normalization, AlphaPose affine, per-joint decode
+- Returns IMAGE-SPACE keypoints [K,3] (x,y,conf)
+- Fails fast if SPPE not loaded or heatmaps are all-zero
 """
 
 from __future__ import annotations
-import sys, logging
 from pathlib import Path
-from typing import List, Tuple, Optional
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Union
+
+import sys
 import numpy as np
 import cv2
+import torch
+import torch.nn as nn
 
-log = logging.getLogger(__name__)
+# ---- Paths to your AlphaPose clone + model files ----
+REPO_ROOT = Path("/home/athena/DaRA_Thesis/AlphaPose_OSNet_Pipeline").resolve()
+ALPHAPOSE_DIR = REPO_ROOT / "AlphaPose"
 
-class AlphaPoseNotReady(Exception): pass
+# Your confirmed files:
+POSE_CFG  = ALPHAPOSE_DIR / "configs/coco/hrnet/256x192_w32_lr1e-3.yaml"
+POSE_CKPT = ALPHAPOSE_DIR / "pretrained_models/pose_hrnet_w32_256x192.pth"
+
+def _inject_paths() -> None:
+    for p in (REPO_ROOT, ALPHAPOSE_DIR):
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+_inject_paths()
+
+# ---- AlphaPose utilities ----
+def _import_transforms():
+    from alphapose.utils.transforms import get_affine_transform, transform_preds  # type: ignore
+    return get_affine_transform, transform_preds
+
+def _import_get_max_preds():
+    try:
+        from alphapose.utils.metrics import get_max_preds  # type: ignore
+        return get_max_preds
+    except Exception:
+        def get_max_preds(hm: torch.Tensor):
+            N, K, H, W = hm.shape
+            flat = hm.reshape(N, K, -1)
+            maxvals, idx = torch.max(flat, dim=2, keepdim=True)
+            idx = idx.to(torch.float32)
+            preds = torch.zeros((N, K, 2), device=hm.device, dtype=torch.float32)
+            preds[..., 0] = (idx % W).squeeze(-1)
+            preds[..., 1] = (idx // W).squeeze(-1)
+            return preds, maxvals
+        return get_max_preds
+
+get_affine_transform, transform_preds = _import_transforms()
+get_max_preds = _import_get_max_preds()
+
+@dataclass
+class SPPEConfig:
+    # HRNet input (H, W) for 256x192 models
+    input_size: Tuple[int, int] = (256, 192)
+    device: str = "cuda"
+    sppe_cfg_yaml: Optional[Path] = POSE_CFG
+    sppe_checkpoint: Optional[Path] = POSE_CKPT
+    fp16: bool = False
 
 class AlphaPoseRunner:
-    def __init__(self,
-        alphapose_dir: Path,
-        device: str = "cuda",
-        yolo_cfg: Optional[Path] = None,
-        yolo_weights: Optional[Path] = None,
-        yolo_conf: float = 0.25,
-        yolo_iou: float = 0.45,
-        pose_cfg: Optional[Path] = None,
-        pose_ckpt: Optional[Path] = None,
-    ):
-        self.alphapose_dir = Path(alphapose_dir).resolve()
-        if not self.alphapose_dir.exists(): raise FileNotFoundError(self.alphapose_dir)
-        if str(self.alphapose_dir) not in sys.path: sys.path.insert(0, str(self.alphapose_dir))
+    """
+    API:
+      pose_on_boxes(frame_bgr, boxes_xyxy) -> (list[(K,3)], list[float])
+      Returns Kx3 [x,y,conf] in ORIGINAL IMAGE COORDS.
+    """
+    def __init__(self, cfg: Optional[SPPEConfig] = None, sppe_model: Optional[nn.Module] = None):
+        self.cfg = cfg or SPPEConfig()
+        use_cuda = torch.cuda.is_available() and "cuda" in self.cfg.device
+        self.device = torch.device(self.cfg.device if use_cuda else "cpu")
+        self.in_h, self.in_w = self.cfg.input_size  # (H,W)
+        self.K = 17
 
-        import torch
-        wants_cuda = (str(device).lower() == "cuda")
-        self.device = "cuda" if wants_cuda and torch.cuda.is_available() else "cpu"
-        if self.device == "cpu" and wants_cuda: log.warning("CUDA requested but unavailable; using CPU.")
-        self._torch_device = torch.device(self.device)
+        # AlphaPose normalization (expects RGB)
+        self.mean = np.array([0.406, 0.457, 0.485], dtype=np.float32)
+        self.std  = np.array([0.225, 0.224, 0.229], dtype=np.float32)
 
-        # smoke-test package
+        if sppe_model is not None:
+            self.model = sppe_model
+        else:
+            self.model = self._build_from_cfg_dynamic()
+
+        self.model.to(self.device).eval()
+        if self.cfg.fp16 and self.device.type == "cuda":
+            self.model.half()
+
+    # ----------- dynamic model builder (handles multiple AlphaPose APIs) -----------
+    def _build_from_cfg_dynamic(self) -> nn.Module:
+        cfgp, ckptp = self.cfg.sppe_cfg_yaml, self.cfg.sppe_checkpoint
+        if not cfgp or not ckptp or (not Path(cfgp).is_file()) or (not Path(ckptp).is_file()):
+            raise RuntimeError(
+                f"AlphaPose cfg/ckpt missing.\n  cfg: {cfgp}\n  ckpt: {ckptp}\n"
+                "Provide valid files to run SPPE."
+            )
+
+        from alphapose.utils.config import update_config  # type: ignore
+        ap_cfg = update_config(str(cfgp))
+
+        # Try multiple builder signatures
+        model = None
         try:
-            from alphapose.models import builder as _
-            from alphapose.utils.config import update_config as _
+            from alphapose.models import builder as B  # type: ignore
         except Exception as e:
-            raise AlphaPoseNotReady("Failed to import alphapose package.") from e
+            raise RuntimeError(f"Cannot import alphapose.models.builder: {e}")
 
-        # YOLOv3 (optional)
-        self.yolo_cfg = Path(yolo_cfg) if yolo_cfg else None
-        self.yolo_weights = Path(yolo_weights) if yolo_weights else None
-        self.yolo_conf = float(yolo_conf); self.yolo_iou = float(yolo_iou)
-        self._det = None
-
-        # HRNet
-        self.pose_cfg = Path(pose_cfg) if pose_cfg else None
-        self.pose_ckpt = Path(pose_ckpt) if pose_ckpt else None
-        self._sppe = None; self._pose_cfg = None
-
-    def warmup(self, enable_internal_detector: bool = True):
-        # Optional internal YOLOv3
-        if enable_internal_detector and self.yolo_cfg and self.yolo_weights:
+        # 1) Preferred in many versions: build_sppe(cfg.MODEL, cfg.DATA_PRESET)
+        if model is None and hasattr(B, "build_sppe"):
             try:
-                from alphapose.detector.yolo_api import YOLODetector
-                self._det = YOLODetector(
-                    cfgfile=str(self.yolo_cfg), weightfile=str(self.yolo_weights),
-                    conf_thres=self.yolo_conf, nms_thres=self.yolo_iou, device=self.device
-                )
-                log.info("AlphaPose internal detector (YOLOv3) loaded.")
+                model = B.build_sppe(ap_cfg.MODEL, ap_cfg.DATA_PRESET)
             except Exception as e:
-                self._det = None; log.warning("Internal detector failed: %s", e)
-        else:
-            self._det = None
+                print(f"[AlphaPose] build_sppe failed: {e}")
 
-        # HRNet (SPPE)
-        try:
-            import torch
-            from alphapose.models import builder
-            from alphapose.utils.config import update_config
+        # 2) Older/newer variants: get_pose_net(cfg, is_train=False)
+        if model is None and hasattr(B, "get_pose_net"):
+            try:
+                model = B.get_pose_net(ap_cfg, is_train=False)
+            except Exception as e:
+                print(f"[AlphaPose] get_pose_net failed: {e}")
 
-            if not self.pose_cfg or not self.pose_cfg.exists(): raise FileNotFoundError(self.pose_cfg)
-            if not self.pose_ckpt or not self.pose_ckpt.exists(): raise FileNotFoundError(self.pose_ckpt)
+        # 3) Generic factory: get_model('pose', cfg, ...)
+        if model is None and hasattr(B, "get_model"):
+            try:
+                model = B.get_model('pose', ap_cfg, is_train=False)
+            except Exception as e:
+                print(f"[AlphaPose] get_model('pose', ...) failed: {e}")
 
-            cfg = update_config(str(self.pose_cfg))
-            self._pose_cfg = cfg
-            self._sppe = builder.build_sppe(cfg.MODEL, preset_cfg=cfg.DATA_PRESET)
-            ckpt = torch.load(str(self.pose_ckpt), map_location=self._torch_device)
-            state_dict = ckpt.get("state_dict", ckpt)
-            self._sppe.load_state_dict(state_dict, strict=False)
-            self._sppe.to(self._torch_device).eval()
-            log.info("HRNet (SPPE) loaded.")
-        except Exception as e:
-            self._sppe = None; self._pose_cfg = None; log.warning("HRNet failed: %s", e)
+        if model is None:
+            raise RuntimeError(
+                "Could not build SPPE from alphapose.models.builder. "
+                "Your AlphaPose version lacks build_sppe/get_pose_net/get_model for pose."
+            )
 
-    # --- Internal detector path (legacy) -------------------------------------
-    def _internal_detect(self, frame_bgr) -> List[List[float]]:
-        if self._det is None: return []
-        import torch
-        H, W = frame_bgr.shape[:2]
-        try:
-            prepped = self._det.image_preprocess(frame_bgr)
-        except Exception:
-            prepped = self._det.image_preprocess([frame_bgr])
+        # Load weights with prefix fixups
+        state = torch.load(str(ckptp), map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
 
-        im_batches, im_dim_list = None, None
-        if isinstance(prepped, (torch.Tensor, np.ndarray)):
-            im_batches = prepped; im_dim_list = [(W, H)]
-        elif isinstance(prepped, (list, tuple)):
-            if len(prepped) == 2: im_batches, im_dim_list = prepped
-            elif len(prepped) >= 3: im_batches, im_dim_list = prepped[0], prepped[2] if isinstance(prepped[2], list) else [(W,H)]
-        else:
-            im_batches = prepped; im_dim_list = [(W, H)]
-        if not isinstance(im_dim_list, (list, tuple)):
-            im_dim_list = [(W, H)]
-        if not hasattr(im_dim_list, "shape"):
-            im_dim_list = torch.tensor(im_dim_list, dtype=torch.float32)
+        def try_load(m, sd):
+            missing, unexpected = m.load_state_dict(sd, strict=False)
+            return missing, unexpected
 
-        try:
-            det_out = self._det.images_detection(im_batches, im_dim_list)
-        except TypeError:
-            det_out = self._det.images_detection(im_batches, im_dim_list, None)
+        def flip_prefix(sd, prefix: str):
+            if all(k.startswith(prefix) for k in sd.keys()):
+                return {k[len(prefix):]: v for k, v in sd.items()}
+            else:
+                return {f"{prefix}{k}": v for k, v in sd.items()}
 
-        dets = det_out[0] if isinstance(det_out, (list, tuple)) and len(det_out) > 0 else det_out
-        if dets is None: return []
-        boxes = []
-        try:
-            for d in dets:
-                x1, y1, x2, y2 = float(d[0]), float(d[1]), float(d[2]), float(d[3])
-                conf = float(d[4]) if len(d) > 4 else 1.0
-                boxes.append([x1, y1, x2, y2, conf])
-        except Exception:
-            boxes = []
-        return boxes
+        # attempt 1: as-is
+        missing, unexpected = try_load(model, state)
+        # if obviously mismatched, try removing/adding common prefixes
+        if len(missing) > 500:
+            for pref in ("module.", "model."):
+                fixed = flip_prefix(state, pref)
+                missing, unexpected = try_load(model, fixed)
+                if len(missing) < 500:
+                    state = fixed
+                    break
 
-    # --- Pose on given boxes (works with YOLOv8) -----------------------------
-    def pose_on_boxes(self, frame_bgr, boxes_xyxy: List[List[float]]):
-        """Run HRNet on provided [x1,y1,x2,y2,(score?)] boxes."""
-        if self._sppe is None or not boxes_xyxy: return [], []
-        import torch
-        from alphapose.utils.transforms import get_affine_transform
+        total = sum(p.numel() for p in model.parameters())
+        loaded = sum(v.numel() for k, v in model.state_dict().items() if k not in missing)
+        print(f"[AlphaPose] Weights loaded. Missing={len(missing)} Unexpected={len(unexpected)} "
+              f"ParamsLoaded≈{loaded}/{total}")
+        if loaded < total * 0.6:
+            raise RuntimeError(
+                "Too few weights matched the model. "
+                "Check YAML/ckpt pairing (w32 vs w48, 256x192 vs 384x288) and prefixes."
+            )
+        return model
 
-        cfg = self._pose_cfg
-        inp_w, inp_h = (256, 192)
-        if hasattr(cfg.DATA_PRESET, "IMAGE_SIZE"):
-            inp_w, inp_h = cfg.DATA_PRESET.IMAGE_SIZE  # (w,h)
+    # ---------------------------- preprocessing (affine) ----------------------------
+    def _preproc(self, img_bgr: np.ndarray, box: np.ndarray):
+        x1, y1, x2, y2 = box.astype(np.float32)
+        w = max(1.0, float(x2 - x1)); h = max(1.0, float(y2 - y1))
+        center = np.array([x1 + 0.5 * w, y1 + 0.5 * h], dtype=np.float32)
+        scale = max(w, h) * 1.25  # AlphaPose convention
 
-        results, scores = [], []
-        for b in boxes_xyxy:
-            x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
-            w, h = max(1.0, x2 - x1), max(1.0, y2 - y1)
-            center = np.array([x1 + 0.5*w, y1 + 0.5*h], dtype=np.float32)
-            scale  = max(h/200.0, w/200.0)
-            trans  = get_affine_transform(center, scale, 0, (int(inp_w), int(inp_h)))
-            patch  = cv2.warpAffine(frame_bgr, trans, (int(inp_w), int(inp_h)))
-            patch  = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
-            inp    = np.transpose(patch, (2,0,1))[None, ...]
-            inp_t  = torch.from_numpy(inp).to(self._torch_device)
-            with torch.no_grad():
-                hm = self._sppe(inp_t)  # [1,K,H,W]
-            hm_np = hm.squeeze(0).cpu().numpy()
-            K, Hm, Wm = hm_np.shape
+        getT = get_affine_transform
+        trans = getT(center, scale, 0, (self.in_w, self.in_h))  # size=(W,H)
 
-            kpts, kscs = [], []
-            for j in range(K):
-                idx = int(np.argmax(hm_np[j])); yy, xx = divmod(idx, Wm)
-                score = float(np.max(hm_np[j]))
-                sx, sy = w / Wm, h / Hm
-                kpts.append((float(x1 + xx*sx), float(y1 + yy*sy), score))
-                kscs.append(score)
-            results.append(kpts)
-            scores.append(float(np.mean(kscs)) if kscs else 0.0)
-        return results, scores
+        crop = cv2.warpAffine(img_bgr, trans, (self.in_w, self.in_h), flags=cv2.INTER_LINEAR)
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        crop = (crop - self.mean) / self.std
+        ten = torch.from_numpy(crop.transpose(2, 0, 1)).unsqueeze(0)  # (1,3,H,W)
+        return ten.to(self.device), trans
 
-    def infer(self, frame_bgr, use_internal_detector: bool = True):
-        """
-        Convenience path:
-         - if use_internal_detector: run internal detect + pose
-         - else: just return empty (for external detector mode)
-        """
-        if use_internal_detector:
-            boxes_full = self._internal_detect(frame_bgr)  # [x1,y1,x2,y2,score]
-            boxes = [[b[0], b[1], b[2], b[3]] for b in boxes_full]
-            kpts, pose_scores = self.pose_on_boxes(frame_bgr, boxes_full)
-            n = min(len(boxes), len(kpts), len(pose_scores))
-            boxes, kpts, pose_scores = boxes[:n], kpts[:n], pose_scores[:n]
-            det_scores = [b[4] for b in boxes_full][:n] if boxes_full else []
-            scores = pose_scores if any(pose_scores) else (det_scores if det_scores else [0.0]*n)
-            feats  = [None]*n
-            return boxes, kpts, scores, feats
-        else:
-            return [], [], [], []
+    # ----------------------------------- API -----------------------------------
+    @torch.inference_mode()
+    def pose_on_boxes(
+        self,
+        frame_bgr: np.ndarray,
+        boxes_xyxy: Union[List[List[float]], np.ndarray]
+    ) -> Tuple[List[np.ndarray], List[float]]:
+        keypoints_out: List[np.ndarray] = []
+        pose_scores_out: List[float] = []
+
+        if boxes_xyxy is None:
+            return keypoints_out, pose_scores_out
+        boxes = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
+        if boxes.size == 0:
+            return keypoints_out, pose_scores_out
+
+        batch, trans_list = [], []
+        for b in boxes:
+            ten, trans = self._preproc(frame_bgr, b)
+            batch.append(ten); trans_list.append(trans)
+        inp = torch.cat(batch, dim=0)  # (N,3,H,W)
+        if self.cfg.fp16 and self.device.type == "cuda":
+            inp = inp.half()
+
+        hm = self.model(inp)  # (N,K,h,w) or list/tuple
+        if isinstance(hm, (list, tuple)):
+            hm = hm[-1]
+        hm = hm.float()
+
+        if torch.allclose(hm, torch.zeros_like(hm)):
+            raise RuntimeError("SPPE produced all-zero heatmaps. Check cfg/ckpt and preprocessing (RGB).")
+
+        preds_hm, maxvals = get_max_preds(hm.detach())  # (N,K,2), (N,K,1)
+        N, K, _ = preds_hm.shape
+        _, _, Hh, Wh = hm.shape
+
+        # heatmap -> input space
+        sx = float(self.in_w) / float(Wh)
+        sy = float(self.in_h) / float(Hh)
+        preds_in = preds_hm.clone()
+        preds_in[..., 0] *= sx
+        preds_in[..., 1] *= sy
+
+        # input -> image space via inverse affine
+        for i in range(N):
+            pts_in = preds_in[i].cpu().numpy()  # (K,2)
+            invT = cv2.invertAffineTransform(trans_list[i])
+            xy = np.empty((K, 2), dtype=np.float32)
+            xy[:, 0] = invT[0,0]*pts_in[:,0] + invT[0,1]*pts_in[:,1] + invT[0,2]
+            xy[:, 1] = invT[1,0]*pts_in[:,0] + invT[1,1]*pts_in[:,1] + invT[1,2]
+
+            conf = maxvals[i].cpu().numpy().reshape(-1)
+            kpt = np.concatenate([xy, conf[:, None]], axis=1)  # image-space
+            keypoints_out.append(kpt)
+
+            vis = conf > 0
+            pose_scores_out.append(float(conf[vis].mean() if vis.any() else conf.mean()))
+        return keypoints_out, pose_scores_out
