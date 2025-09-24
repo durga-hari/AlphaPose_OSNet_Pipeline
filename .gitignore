@@ -8,3 +8,4 @@ AlphaPose/*.pth
 AlphaPose/*.pt
 AlphaPose/*.onnx
 AlphaPose/*.weights
+Pipeline/cuda-repo-ubuntu2204-12-8-local_*.deb
