@@ -28,6 +28,7 @@ dependencies:
       - tensorboard
       - cython
       - easydict
+      - av
 
 
 
