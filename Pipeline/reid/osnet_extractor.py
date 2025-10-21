@@ -29,7 +29,6 @@ class OSNetExtractor:
                                          model_path=str(w),
                                          device=self.device)
             # Hack: load the checkpoint manually if needed
-            import torch
             state = torch.load(str(w), map_location=self.device, weights_only=False)
             # Normally FeatureExtractor handles this internally, so this is optional
             self.ok = True

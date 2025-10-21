@@ -89,7 +89,9 @@ class StrongSORTTracker:
         for i, b in enumerate(boxes):
             if assigned[i]: continue
             tid=self._next_id; self._next_id+=1
-            self._tracks[tid]={"kf":_KF(b), "feat": (feats[i] if i<len(feats) else None), "age":0}
+            self._tracks[tid]={"kf":_KF(b), 
+                               "feat": (feats[i] if  feats is not None and i<len(feats) else None), 
+                               "age":0}
             ids[i]=tid
 
         return ids

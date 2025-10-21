@@ -1,22 +1,29 @@
-video_path: "/home/arun_remote/DaRA_Thesis/Session_4/AC12.mp4"
-out_dir: "/home/arun_remote/DaRA_Thesis/Output_AP_OSNET/AC12_COCO_WB_Op"
+video_path: "/home/arun_remote/DaRA_Thesis/Session_4"
+out_dir: "/home/arun_remote/DaRA_Thesis/Output_AP_OSNET"
 
 detector:
   type: "yolov8"
   model: "yolov8s"
   weights: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/pretrained/yolov8m.pt"
   imgsz: 1280    #640-previous smaller image size. can be improved  to 960 or 1280 for better detection
-  conf: 0.6
+  conf: 0.45
   iou: 0.65
   half: true
 
 pose:
   type: "alphapose"
-  cfg: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/configs/coco_wholebody/resnet/256x192_res50_lr1e-3_2x-combined.yaml"
-  ckpt: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/pretrained_models/coco_wholebody133_fast50_combined_256x192.pth"
+  cfg: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/configs/coco/hrnet/256x192_w32_lr1e-3.yaml"
+  ckpt: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/pretrained_models/pose_hrnet_w32_256x192.pth"
   device: "cuda"
   input_size: [256,192] # (H,W) #can be changed to (384,288) or (512,384) for better accuracy but slower #COCO default- (256,192)
   fp16: false
+
+# hand_pose:
+#   cfg: /path/to/alphapose/configs/halpe_hand/224x224_res50_lr1e-3.yaml
+#   ckpt: /path/to/weights/halpe_hand_res50_224x224.pth
+#   input_size: [224, 224]
+#   device: cuda
+#   fp16: false  
 
 reid:
   type: "osnet"
@@ -34,12 +41,12 @@ pipeline:
   save_video: true
   save_json: true
   save_embeds: true
-  kpt_thresh: 0.45
-  kp_set: "coco_wholebody" #"coco" "coco_wholebody" "halpe"
+  kpt_thresh: 0.50
+  kp_set: "coco" #"coco" "coco_wholebody" "halpe" ,"coco_hybrid"
   hand_kpt_thresh: 0.25
   wrist_kpt_thresh: 0.25
 
-  max_frames: 1000
+  max_frames: 10000
   log_level: "INFO"
   log_every: 50
   debug_heatmaps: true #for debugs
