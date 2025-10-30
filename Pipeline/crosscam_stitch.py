@@ -47,7 +47,7 @@ def build_track_embeds(cam_dir: Path) -> Dict[int, dict]:
         t=rec.get("frame", None)
         for p in rec.get("poses", []):
             pid=int(p.get("id", -1))
-            emb=p.get("emb", None)
+            emb=p.get("emb", p.get("embeds", None))
             if pid<0: continue
             if pid not in tr: tr[pid]={"sum":None,"n":0,"t0":t,"t1":t}
             if emb is not None:

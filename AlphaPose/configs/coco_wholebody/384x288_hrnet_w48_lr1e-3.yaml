@@ -1,0 +1,71 @@
+DATASET:
+  TRAIN:
+    TYPE: COCO_wholebody
+    ROOT: 'data/coco_wholebody/'
+    IMG_PREFIX: 'images/train2017/'
+    ANN: 'data/coco_wholebody/annotations/coco_wholebody_train_v1.0.json'
+  VAL:
+    TYPE: COCO_wholebody
+    ROOT: 'data/coco_wholebody/'
+    IMG_PREFIX: 'images/val2017/'
+    ANN: 'data/coco_wholebody/annotations/coco_wholebody_val_v1.0.json'
+
+MODEL:
+  TYPE: pose_hrnet
+  PRETRAINED: 'pretrained_models/hrnet_w48-8ef0771d.pth'
+  IMAGE_SIZE: [384, 288]
+  HEATMAP_SIZE: [96, 72]
+  SIGMA: 2
+  NUM_JOINTS: 133
+  EXTRA:
+    FINAL_CONV_KERNEL: 1
+    PRETRAINED_LAYERS: ['*']
+    STAGE2:
+      NUM_MODULES: 1
+      NUM_BRANCHES: 2
+      BLOCK: BASIC
+      NUM_BLOCKS: [4, 4]
+      NUM_CHANNELS: [48, 96]
+      FUSE_METHOD: SUM
+    STAGE3:
+      NUM_MODULES: 4
+      NUM_BRANCHES: 3
+      BLOCK: BASIC
+      NUM_BLOCKS: [4, 4, 4]
+      NUM_CHANNELS: [48, 96, 192]
+      FUSE_METHOD: SUM
+    STAGE4:
+      NUM_MODULES: 3
+      NUM_BRANCHES: 4
+      BLOCK: BASIC
+      NUM_BLOCKS: [4, 4, 4, 4]
+      NUM_CHANNELS: [48, 96, 192, 384]
+      FUSE_METHOD: SUM
+
+LOSS:
+  TYPE: JointsMSELoss
+  USE_TARGET_WEIGHT: true
+
+TRAIN:
+  BATCH_SIZE: 32
+  END_EPOCH: 140
+  OPTIMIZER: adam
+  LR: 0.001
+  LR_FACTOR: 0.1
+  LR_STEP: [90, 120]
+  WORKERS: 8
+  PRINT_FREQ: 100
+  RESUME: false
+
+TEST:
+  BATCH_SIZE: 32
+  FLIP_TEST: true
+  MODEL_FILE: ''
+  DATASET: coco_wholebody
+  DETECTOR: yolo
+  USE_GT_BBOX: false
+  HEATMAPS: true
+
+OUTPUT_DIR: 'exp/coco_wholebody/pose_hrnet/384x288_hrnet_w48'
+LOG_DIR: 'exp/coco_wholebody/logs'
+GPUS: (0,)

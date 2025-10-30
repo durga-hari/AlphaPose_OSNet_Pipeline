@@ -46,7 +46,7 @@ pipeline:
   hand_kpt_thresh: 0.25
   wrist_kpt_thresh: 0.25
 
-  max_frames: 10000
+  max_frames: 2000
   log_level: "INFO"
   log_every: 50
   debug_heatmaps: true #for debugs
