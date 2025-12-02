@@ -29,6 +29,137 @@ def color_for_id(id_num: int) -> tuple[int, int, int]:
     r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
     return int(r * 255), int(g * 255), int(b * 255)
 
+# ============================================================
+#   Visualization: annotate videos with local vs global IDs
+# ============================================================
+def annotate_videos_with_ids(out_root: Path, max_frames: int = None):
+    """
+    Create two annotated videos per camera folder: local IDs and global IDs.
+    Automatically aligns frame counts using 'max_frames' from pipeline config.
+    Handles dropped or mismatched frames safely.
+    """
+    import colorsys, cv2, json, random
+    from tqdm import tqdm
+
+    # --------------------------
+    # Color generator
+    # --------------------------
+    def color_for_id(id_num: int, mode="local"):
+        seed_offset = 1 if mode == "local" else 99991
+        random.seed(int(id_num) * seed_offset)
+        hue = ((int(id_num) * 37) % 360) / 360.0
+        sat, val = (0.9, 0.9) if mode == "local" else (0.8, 0.8)
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        return int(b * 255), int(g * 255), int(r * 255)
+
+    # --------------------------
+    # Load JSONL to dict
+    # --------------------------
+    def load_jsonl(path):
+        frame_dict = {}
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                frame = int(rec.get("frame", 0))
+                poses = rec.get("poses", [])
+                frame_dict.setdefault(frame, []).extend(poses)
+        return frame_dict
+
+    def annotate(video_path: Path, anno_dict: dict, out_path: Path, mode="local"):
+        """Draw either local or global IDs and ensure equal frame counts for both videos."""
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Respect the pipeline's max_frames setting (None = no limit)
+        if max_frames is not None and max_frames > 0:
+            total = min(total, max_frames)
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+
+        if len(anno_dict) == 0:
+            print(f"⚠️ No annotations found in {video_path.stem} ({mode})")
+            # Still create an empty video with the same frame count for consistency
+            for _ in range(total):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                out.write(frame)
+            cap.release()
+            out.release()
+            print(f"✅ (empty) Saved → {out_path}")
+            return
+
+        fmin, fmax = min(anno_dict), max(anno_dict)
+        print(f"Annotating {video_path.name} ({mode}): {len(anno_dict)} annotated frames "
+              f"[{fmin}-{fmax}] → writing {total} total frames")
+
+        for frame_idx in tqdm(range(total), desc=f"{video_path.stem} ({mode})"):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Handle ±1 mismatch in annotation frame indices
+            poses = (anno_dict.get(frame_idx)
+                     or anno_dict.get(frame_idx + 1)
+                     or anno_dict.get(frame_idx - 1)
+                     or [])
+
+            # Always write frame, even if there are no poses
+            for p in poses:
+                id_val = p.get("id") if mode == "local" else p.get("global_id")
+                bbox = p.get("bbox")
+                if id_val is None or bbox is None:
+                    continue
+                x1, y1, x2, y2 = map(int, bbox)
+                color = color_for_id(int(id_val), mode)
+                label = f"{'LID' if mode == 'local' else 'GID'} {id_val}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, label, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            out.write(frame)
+
+        cap.release()
+        out.release()
+        print(f" Saved → {out_path}")
+
+    # --------------------------
+    # Iterate through all cameras
+    # --------------------------
+    for cam_dir in sorted(out_root.glob("*")):
+        if not cam_dir.is_dir():
+            continue
+
+        # Always use the raw session video as input, not any annotated outputs
+        src_dir = Path("/home/arun_remote/DaRA_Thesis/Session_4")
+        video = src_dir / f"{cam_dir.name}.mp4"
+        if not video.exists():
+            print(f" Skipping {cam_dir.name}: cannot find raw video {video}")
+            continue
+
+        json_local = next(cam_dir.glob("*_poses.jsonl"), None)
+        json_global = next(cam_dir.glob("*_poses_union.jsonl"), None)
+
+        if not (video and json_local and json_global):
+            print(f" Skipping {cam_dir.name}: missing video or JSONL.")
+            continue
+
+        local_dict = load_jsonl(json_local)
+        global_dict = load_jsonl(json_global)
+
+        out_local = cam_dir / f"{cam_dir.name}_localids.mp4"
+        out_global = cam_dir / f"{cam_dir.name}_globalids.mp4"
+
+        annotate(video, local_dict, out_local, mode="local")
+        annotate(video, global_dict, out_global, mode="global")
+
+
+
 
 def ndarray_to_list(obj):
     if isinstance(obj, np.ndarray):
@@ -250,35 +381,65 @@ def hybrid_similarity(embA: np.ndarray, embB: np.ndarray,
     return alpha * emb_sim + (1 - alpha) * pose_sim
 
 
-def build_track_centroids_with_pose(cam_dir: Path, min_samples: int = 2):
-    """Compute mean embedding and mean pose per track."""
+def build_track_centroids_with_pose(cam_dir: Path, min_samples: int = 35):
     poses_path = next(cam_dir.glob("*_poses.jsonl"), None)
     if not poses_path:
         return {}
-    tracks = defaultdict(lambda: {"embs": [], "kps": []})
-    for line in open(poses_path):
-        rec = json.loads(line)
-        poses, emb_list = rec.get("poses", []), rec.get("embeds")
-        if isinstance(emb_list, list) and len(emb_list) == len(poses):
+
+    tracks = defaultdict(lambda: {"embs": [], "kps": [], "frames": []})
+
+    with poses_path.open("r") as f:
+        for line in f:
+            rec = json.loads(line)
+            frame_idx = rec.get("frame", None)
+            poses, emb_list = rec.get("poses", []), rec.get("embeds")
+
+            if not isinstance(emb_list, list) or len(emb_list) != len(poses):
+                continue
+
             for p, e in zip(poses, emb_list):
                 tid = int(p.get("id", -1))
                 if tid < 0:
                     continue
-                tracks[tid]["embs"].append(l2_normalize(np.asarray(e, np.float32)))
+                v = l2_normalize(np.asarray(e, np.float32))
+                tracks[tid]["embs"].append(v)
                 tracks[tid]["kps"].append(np.asarray(p.get("keypoints"), np.float32))
+                if frame_idx is not None:
+                    tracks[tid]["frames"].append(int(frame_idx))
+
     centroids = {}
     for tid, data in tracks.items():
-        if len(data["embs"]) >= min_samples:
-            mean_emb = l2_normalize(np.mean(np.stack(data["embs"]), axis=0))
-            mean_kps = np.mean(np.stack(data["kps"]), axis=0)
-            centroids[tid] = {"emb": mean_emb, "pose": mean_kps}
+        if len(data["embs"]) < min_samples:
+            continue
+
+        embs = np.stack(data["embs"])
+        kps = np.stack(data["kps"])
+        mean_emb = l2_normalize(embs.mean(axis=0))
+        mean_kps = kps.mean(axis=0)
+
+        if data["frames"]:
+            start = min(data["frames"])
+            end = max(data["frames"])
+        else:
+            start = 0
+            end = 0
+
+        centroids[tid] = {
+            "emb": mean_emb,
+            "pose": mean_kps,
+            "start": start,
+            "end": end,
+        }
+
     return centroids
 
-def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.85):
+
+def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.80):
     """
     Merge fragmented local tracks within each camera using embedding similarity.
     Updates each *_poses.jsonl in-place (with new merged IDs).
     """
+    MIN_TRACK_LEN = 35
     logging.info(f"[IntraCam] Merging local tracks within each camera (thr={sim_thr})")
     for cam_dir in sorted(out_root.glob("*")):
         if not cam_dir.is_dir():
@@ -287,8 +448,8 @@ def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.85):
         if not poses_path:
             continue
 
-        # Build centroids
-        centroids = {}
+        # Build centroids and track lengths
+        raw_vecs = {}
         for line in open(poses_path):
             rec = json.loads(line)
             poses, emb_list = rec.get("poses", []), rec.get("embeds")
@@ -298,15 +459,21 @@ def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.85):
                     if tid < 0:
                         continue
                     v = l2_normalize(np.asarray(e, np.float32))
-                    centroids.setdefault(tid, []).append(v)
+                    raw_vecs.setdefault(tid, []).append(v)
 
-        for tid in list(centroids.keys()):
-            arr = np.stack(centroids[tid])
+        # Drop very short tracks first
+        centroids = {}
+        for tid, vecs in raw_vecs.items():
+            if len(vecs) < MIN_TRACK_LEN:
+                continue
+            arr = np.stack(vecs)
             centroids[tid] = l2_normalize(arr.mean(axis=0))
 
         tids = list(centroids.keys())
         if len(tids) <= 1:
+            logging.info(f"[IntraCam] {cam_dir.name}: not enough valid tracks after filtering.")
             continue
+
 
         # Compute pairwise cosine matrix
         mat = np.zeros((len(tids), len(tids)), np.float32)
@@ -348,7 +515,8 @@ def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.85):
 
 def run_crosscam_union_stitch(out_root: Path,
                               cos_thr: float = 0.45,
-                              alpha: float = 0.55):
+                              alpha: float = 0.50,
+                              time_slack: int = 30):
     """
     Union-based global ID stitching with hybrid (embedding + pose) similarity.
     cos_thr – final blended similarity threshold (lower for more merges)
@@ -372,9 +540,24 @@ def run_crosscam_union_stitch(out_root: Path,
 
             # Compute hybrid similarity matrix
             for r, tid_i in enumerate(tids_i):
-                vi, pi = ti[tid_i]["emb"], ti[tid_i]["pose"]
+                ti_rec = ti[tid_i]
+                vi, pi = ti_rec["emb"], ti_rec["pose"]
+                si_start, si_end = ti_rec.get("start", 0), ti_rec.get("end", 0)
+
                 for c, tid_j in enumerate(tids_j):
-                    vj, pj = tj[tid_j]["emb"], tj[tid_j]["pose"]
+                    tj_rec = tj[tid_j]
+                    vj, pj = tj_rec["emb"], tj_rec["pose"]
+                    sj_start, sj_end = tj_rec.get("start", 0), tj_rec.get("end", 0)
+
+                    # --- temporal gating: skip pairs that never overlap in time ---
+                    latest_start = max(si_start, sj_start)
+                    earliest_end = min(si_end, sj_end)
+                    if latest_start > earliest_end + time_slack:
+                        # no temporal overlap even with slack → cannot be same person
+                        mat[r, c] = -1.0
+                        continue
+
+                    # --- hybrid similarity (appearance + pose) ---
                     mat[r, c] = hybrid_similarity(vi, vj, pi, pj, alpha=alpha)
 
             best_j = np.argmax(mat, 1)
@@ -478,8 +661,8 @@ def merge_tracks_ap(out_root: Path, crosscam_map: Dict[str, Dict[int, int]], out
                         continue
 
                     merged_records.append({
-                        "camera": cam,
-                        "frame": frame,
+                        "cam_id": cam,          # was "camera"
+                        "frame_idx": frame,     # was "frame"
                         "local_id": lid_int,
                         "global_id": int(gid),
                         "bbox": p.get("bbox"),
@@ -519,7 +702,7 @@ def load_config(config_path: str | Path) -> dict:
 
 
 def main():
-    cfg = load_config("pipeline_config.yaml")
+    cfg = load_config("ap_pipeline_config.yaml")
     video_path = Path(cfg["video_path"])
     out_root = Path(cfg["out_dir"])
 
@@ -600,15 +783,20 @@ def main():
     gc.collect()
     time.sleep(1.0)
 
-    merge_intra_camera_tracks(out_root, sim_thr=0.85)
+    merge_intra_camera_tracks(out_root, sim_thr=0.75)
 
     # --- Stage 1: greedy deterministic crosscam stitch ---
     logging.info("Running initial deterministic stitching...")
-    crosscam_map = stitch(out_root, sim_thr=0.55, time_win=900)
+    crosscam_map = stitch(out_root, sim_thr=0.6, time_win=300)
 
     # --- Stage 2: mutual-best Union-Find refinement ---
     logging.info("Running union-based global ID refinement...")
-    crosscam_union_map = run_crosscam_union_stitch(out_root, cos_thr=0.5)
+    crosscam_union_map = run_crosscam_union_stitch(
+                    out_root,
+                    cos_thr=0.55,   # was 0.5 → slightly easier to merge true same-person tracks
+                    alpha=0.60,
+                    time_slack=30      # give pose a bit more weight vs pure ReID emb
+                )
 
     # Inject and merge results
     inject_global_ids(out_root, crosscam_union_map, suffix="_poses_union.jsonl")
@@ -617,7 +805,12 @@ def main():
     if merged.exists():
         count_global_individuals(merged)
 
-    logging.info("✅ Full AlphaPose + Union Global-ID pipeline complete.")
+    max_frames_cfg = int(pipe_cfg.get("max_frames", 0))
+    max_frames_final = None if max_frames_cfg <= 0 else max_frames_cfg
+    annotate_videos_with_ids(out_root, max_frames=max_frames_final)
+
+        
+    logging.info(" Full AlphaPose + Union Global-ID pipeline complete.")
 
 
 if __name__ == "__main__":

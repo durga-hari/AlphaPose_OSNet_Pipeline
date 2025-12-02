@@ -32,21 +32,21 @@ reid:
 
 tracker:
   type: "strongsort"
-  sim_thr: 0.55
+  sim_thr: 0.45
   iou_thr: 0.6
-  ttl: 80
+  ttl: 150
 
 pipeline:
   draw: true
   save_video: true
   save_json: true
   save_embeds: true
-  kpt_thresh: 0.50
+  kpt_thresh: 0.6
   kp_set: "coco" #"coco" "coco_wholebody" "halpe" ,"coco_hybrid"
   hand_kpt_thresh: 0.25
   wrist_kpt_thresh: 0.25
 
-  max_frames: 200
+  max_frames: 50000
   log_level: "INFO"
   log_every: 50
-  debug_heatmaps: true #for debugs
+  debug_heatmaps: False #for debugs
