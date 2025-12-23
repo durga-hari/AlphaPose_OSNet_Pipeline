@@ -273,7 +273,7 @@ def _inside_expanded_bbox(pt, bbox, margin: float = 0.1) -> bool:
     return (x1 <= x <= x2) and (y1 <= y <= y2)
 
 
-def _draw_lines(img, kpts, edges, kpt_thresh, color, thick, bbox=None, max_rel_len=0.6):
+def _draw_lines(img, kpts, edges, kpt_thresh, color, thick, bbox=None, max_rel_len=0.6):   #default is 0.6 for halpe set it to 1.3
     K = kpts.shape[0]
     diag = None
     if bbox is not None:
@@ -363,10 +363,15 @@ def draw_skeleton(
     ds = dataset.lower()
     kpts = _apply_smoothing(kpts, track_id)
 
+    if ds == "halpe":
+        body_thr = min(kpt_thresh, 0.35)  # cap at ~0.35 for halpe
+    else:
+        body_thr = kpt_thresh
+
     # Draw points
     H, W = img.shape[:2]
     for i, (x, y, c) in enumerate(kpts):
-        if c >= kpt_thresh and 0 <= int(x) < W and 0 <= int(y) < H:
+        if c >= body_thr and 0 <= int(x) < W and 0 <= int(y) < H:
             cv2.circle(img, (int(x), int(y)), 2, color, -1, cv2.LINE_AA)
 
     # Draw lines
@@ -375,7 +380,7 @@ def draw_skeleton(
     elif ds == "coco_wholebody":
         _draw_lines(img, kpts[COCO_WB_BODY_SLICE], COCO_LIMBS, kpt_thresh, color, 2, bbox=bbox)
     elif ds == "halpe":
-        _draw_lines(img, kpts[HALPE_BODY26_SLICE], HALPE_BODY_EDGES, kpt_thresh, color, 2, bbox=bbox)
+        _draw_lines(img, kpts[HALPE_BODY26_SLICE], HALPE_BODY_EDGES, body_thr, color, 2, bbox=bbox)
 
 
 # =====================================================

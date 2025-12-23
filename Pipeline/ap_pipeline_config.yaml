@@ -5,7 +5,7 @@ detector:
   type: "yolov8"
   model: "yolov8s"
   weights: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/pretrained/yolov8m.pt"
-  imgsz: 1280    #640-previous smaller image size. can be improved  to 960 or 1280 for better detection
+  imgsz: 1280    # 640 - previous smaller image size. 960/1280 -> better detection
   conf: 0.45
   iou: 0.65
   half: true
@@ -13,9 +13,11 @@ detector:
 pose:
   type: "alphapose"
   cfg: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/configs/coco/hrnet/256x192_w32_lr1e-3.yaml"
+  # cfg: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/configs/halpe_136/resnet/256x192_res50_lr1e-3_2x-regression.yaml"
   ckpt: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/pretrained_models/pose_hrnet_w32_256x192.pth"
+  # ckpt: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/AlphaPose/pretrained_models/halpe136_fast50_regression_256x192.pth"
   device: "cuda"
-  input_size: [256,192] # (H,W) #can be changed to (384,288) or (512,384) for better accuracy but slower #COCO default- (256,192)
+  input_size: [256,192] # (H,W)  COCO default: (256,192)
   fp16: false
 
 # hand_pose:
@@ -26,27 +28,38 @@ pose:
 #   fp16: false  
 
 reid:
-  type: "osnet"
-  weights: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/pretrained/osnet_x1_0_msmt17.pth"
+  # type: "osnet"  # your OSNet-based ReID (OSNetReID)
+  # or "resnet" / "resnet50" if you want to use the Torchreid ResNet wrapper
+  type:  "resnet"  # "osnet"                                                                                                      
+  weights: "/home/arun_remote/DaRA_Thesis/AlphaPose_OSNet_Pipeline/Pipeline/pretrained/osnet_x1_0_msmt17.pth"  #"/home/arun_remote/DaRA_Thesis/RTMO_DeepSORT_Pipeline/Checkpoints/resnet50_market_xent.pth.tar"
   device: "cuda"
 
 tracker:
-  type: "strongsort"
+  # switch this between "strongsort" and "deepsort"
+  type:     "deepsort" #  "strongsort"
+
+  # StrongSORT-specific params (only used if type == "strongsort")
   sim_thr: 0.45
   iou_thr: 0.6
   ttl: 150
+
+  # DeepSORT-specific params (only used if type == "deepsort")
+  max_cosine_distance: 0.2
+  max_iou_distance: 0.7
+  max_age: 30
+  n_init: 3
 
 pipeline:
   draw: true
   save_video: true
   save_json: true
   save_embeds: true
-  kpt_thresh: 0.6
-  kp_set: "coco" #"coco" "coco_wholebody" "halpe" ,"coco_hybrid"
+  kpt_thresh: 0.6  #the default is 0.6 but for halpe set it to 0.3
+  kp_set: "coco"   # "coco", "coco_wholebody", "halpe", "coco_hybrid"
   hand_kpt_thresh: 0.25
   wrist_kpt_thresh: 0.25
 
   max_frames: 50000
   log_level: "INFO"
   log_every: 50
-  debug_heatmaps: False #for debugs
+  debug_heatmaps: False # debug flag

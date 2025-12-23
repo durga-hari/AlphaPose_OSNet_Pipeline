@@ -29,6 +29,7 @@ def color_for_id(id_num: int) -> tuple[int, int, int]:
     r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
     return int(r * 255), int(g * 255), int(b * 255)
 
+
 # ============================================================
 #   Visualization: annotate videos with local vs global IDs
 # ============================================================
@@ -159,8 +160,6 @@ def annotate_videos_with_ids(out_root: Path, max_frames: int = None):
         annotate(video, global_dict, out_global, mode="global")
 
 
-
-
 def ndarray_to_list(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -170,7 +169,7 @@ def ndarray_to_list(obj):
 
 
 # ============================================================
-#   SequentialPipeline (AlphaPose + OSNet + Tracker)
+#   SequentialPipeline (AlphaPose + ReID + Tracker)
 # ============================================================
 class SequentialPipeline:
     def __init__(
@@ -231,6 +230,7 @@ class SequentialPipeline:
                     continue
 
                 kpts_list, pose_scores, _ = self.pose(frame_bgr, boxes_xyxy)
+
                 if not kpts_list:
                     vw.write(frame_bgr)
                     continue
@@ -249,11 +249,16 @@ class SequentialPipeline:
                     except Exception:
                         embeds = None
 
-                ids = (
-                    self.tracker.update(boxes_xyxy, embeds)
-                    if self.tracker
-                    else list(range(1, boxes_xyxy.shape[0] + 1))
-                )
+                # ---- Tracking: StrongSORT vs DeepSORT ----
+                if self.tracker:
+                    # DeepSORT wrapper exposes update_from_pipeline(boxes, feats)
+                    if hasattr(self.tracker, "update_from_pipeline"):
+                        ids = self.tracker.update_from_pipeline(boxes_xyxy, embeds)
+                    else:
+                        # StrongSORT-style: update(boxes, feats) -> ids
+                        ids = self.tracker.update(boxes_xyxy, embeds)
+                else:
+                    ids = list(range(1, boxes_xyxy.shape[0] + 1))
 
                 annotated = frame_bgr.copy()
                 if self.draw:
@@ -309,8 +314,10 @@ def l2_normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(v)
     return v / (n + eps) if np.isfinite(n) and n > eps else np.zeros_like(v)
 
+
 def cosine(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
     return float(np.dot(l2_normalize(a, eps), l2_normalize(b, eps)))
+
 
 class UnionFind:
     def __init__(self): self.p = {}
@@ -321,6 +328,7 @@ class UnionFind:
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
         if ra != rb: self.p[rb] = ra
+
 
 def build_track_centroids(cam_dir: Path, min_samples: int = 3) -> Dict[int, np.ndarray]:
     poses_path = next(cam_dir.glob("*_poses.jsonl"), None)
@@ -343,6 +351,7 @@ def build_track_centroids(cam_dir: Path, min_samples: int = 3) -> Dict[int, np.n
             m = l2_normalize(s / c)
             centroids[tid] = m
     return centroids
+
 
 # ============================================================
 #   Enhanced Union-based Global ID Matching (with Pose Similarity)
@@ -474,7 +483,6 @@ def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.80):
             logging.info(f"[IntraCam] {cam_dir.name}: not enough valid tracks after filtering.")
             continue
 
-
         # Compute pairwise cosine matrix
         mat = np.zeros((len(tids), len(tids)), np.float32)
         for i, t1 in enumerate(tids):
@@ -512,6 +520,7 @@ def merge_intra_camera_tracks(out_root: Path, sim_thr: float = 0.80):
                 fw.write(json.dumps(rec) + "\n")
         os.replace(tmp_path, poses_path)
         logging.info(f"[IntraCam] {cam_dir.name}: merged → {len(set(remap.values()))} local IDs")
+
 
 def run_crosscam_union_stitch(out_root: Path,
                               cos_thr: float = 0.45,
@@ -590,15 +599,16 @@ def run_crosscam_union_stitch(out_root: Path,
     return gid_map
 
 
-
 # ============================================================
 #   Helper: Inject global IDs and report counts
 # ============================================================
 def inject_global_ids(out_root: Path, crosscam_map: dict, suffix="_poses_union.jsonl"):
     for cam_dir in sorted(out_root.glob("*")):
-        if not cam_dir.is_dir(): continue
+        if not cam_dir.is_dir():
+            continue
         jsonl_file = next(cam_dir.glob("*_poses.jsonl"), None)
-        if not jsonl_file: continue
+        if not jsonl_file:
+            continue
         cam_name = cam_dir.name
         local2global = crosscam_map.get(cam_name, {})
         out_path = cam_dir / f"{cam_name}{suffix}"
@@ -612,6 +622,7 @@ def inject_global_ids(out_root: Path, crosscam_map: dict, suffix="_poses_union.j
                         p["global_id"] = gid
                 fw.write(json.dumps(item) + "\n")
         logging.info(f"[Union] Injected globals → {out_path.name}")
+
 
 def merge_tracks_ap(out_root: Path, crosscam_map: Dict[str, Dict[int, int]], out_path: Path):
     """
@@ -687,7 +698,8 @@ def count_global_individuals(merged_path: Path):
     with open(merged_path) as f:
         for line in f:
             gid = json.loads(line).get("global_id")
-            if gid: seen.add(gid)
+            if gid:
+                seen.add(gid)
     logging.info(f"✅ Total unique individuals across all cameras: {len(seen)}")
     return len(seen)
 
@@ -736,15 +748,24 @@ def main():
         if reid_cfg["type"] != "none"
         else {}
     )
-    tracker_args = (
-        dict(
+
+    # tracker args: StrongSORT vs DeepSORT
+    tracker_type = tracker_cfg.get("type", "none").lower()
+    if tracker_type == "strongsort":
+        tracker_args = dict(
             sim_thr=float(tracker_cfg.get("sim_thr", 0.55)),
             iou_thr=float(tracker_cfg.get("iou_thr", 0.6)),
             ttl=int(tracker_cfg.get("ttl", 80)),
         )
-        if tracker_cfg.get("type", "none") == "strongsort"
-        else {}
-    )
+    elif tracker_type == "deepsort":
+        tracker_args = dict(
+            max_cosine_distance=float(tracker_cfg.get("max_cosine_distance", 0.2)),
+            max_iou_distance=float(tracker_cfg.get("max_iou_distance", 0.7)),
+            max_age=int(tracker_cfg.get("max_age", 30)),
+            n_init=int(tracker_cfg.get("n_init", 3)),
+        )
+    else:
+        tracker_args = {}
 
     pipe = SequentialPipeline(
         detector_name=detector_cfg["type"],
@@ -792,11 +813,11 @@ def main():
     # --- Stage 2: mutual-best Union-Find refinement ---
     logging.info("Running union-based global ID refinement...")
     crosscam_union_map = run_crosscam_union_stitch(
-                    out_root,
-                    cos_thr=0.55,   # was 0.5 → slightly easier to merge true same-person tracks
-                    alpha=0.60,
-                    time_slack=30      # give pose a bit more weight vs pure ReID emb
-                )
+        out_root,
+        cos_thr=0.55,   # was 0.5 → slightly easier to merge true same-person tracks
+        alpha=0.60,
+        time_slack=30,  # give pose a bit more weight vs pure ReID emb
+    )
 
     # Inject and merge results
     inject_global_ids(out_root, crosscam_union_map, suffix="_poses_union.jsonl")
@@ -809,7 +830,6 @@ def main():
     max_frames_final = None if max_frames_cfg <= 0 else max_frames_cfg
     annotate_videos_with_ids(out_root, max_frames=max_frames_final)
 
-        
     logging.info(" Full AlphaPose + Union Global-ID pipeline complete.")
 
 
